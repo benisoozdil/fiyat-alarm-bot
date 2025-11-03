@@ -1,5 +1,5 @@
 # fiyat_bot.py
-# Telegram Fiyat Alarm Botu – Hepsiburada/Trendyol/MediaMarkt TR için siteye özel seçiciler
+# Telegram Fiyat Alarm Botu – siteye özel seçiciler + kuruş (minor units) düzeltmesi
 # Komutlar:
 #   /start
 #   /track <URL> <hedef_fiyat>
@@ -38,200 +38,222 @@ REQ_KW = dict(headers={"User-Agent": UA}, timeout=20)
 def _to_decimal(s: str) -> Decimal | None:
     if not s:
         return None
-    s = s.strip()
-    # 5.499,00 -> 5499.00
-    s = s.replace("\u00a0", " ").replace(".", "").replace(",", ".")
-    # bazen "5499.00 TL" geliyor
+    s = s.strip().replace("\u00a0", " ")
+    # 25.000,00 TL -> "25000.00"
+    s = s.replace(".", "").replace(",", ".")
+    # son temizlik: sadece rakam ve nokta
     s = re.sub(r"[^\d\.]", "", s)
+    if not s:
+        return None
     try:
         val = Decimal(s)
         return val if val > 0 else None
     except InvalidOperation:
         return None
 
-def _first_decimal(*vals) -> Decimal | None:
-    for v in vals:
-        d = _to_decimal(v) if isinstance(v, str) else None
-        if d:
-            return d
-    return None
+def _fix_minor_units(val: Decimal | None) -> Decimal | None:
+    """
+    Birçok sitede JSON sayısal fiyatlar kuruş (minor units) olarak gelebilir:
+      25.000 TL -> 2.500.000 (kuruş)
+    Heuristik:
+      - Değer çok büyükse (>= 100000) ve 100'e tam bölünüyorsa -> /100
+    """
+    if val is None:
+        return None
+    try:
+        if val >= 100_000 and (val % 100 == 0):
+            adj = val / Decimal(100)
+            # Aşırı düzeltmeyi engelle: 100 milyondan büyükse yine saçma olabilir
+            if adj < 100_000_000:
+                logging.info(f"[minor-fix] {val} -> {adj}")
+                return adj
+    except Exception:
+        pass
+    return val
+
+def _pick_best(cands: list[Decimal]) -> Decimal | None:
+    """Adayları filtrele ve mantıklı en iyi fiyatı seç."""
+    if not cands:
+        return None
+    # Kuruş düzeltmesini uygula
+    cands = [_fix_minor_units(x) or x for x in cands]
+    # Negatif/0 dışarı
+    cands = [x for x in cands if x and x > 0]
+    if not cands:
+        return None
+    # Çok absürt büyük değerleri (medyana göre 10x üstü) ele
+    cands_sorted = sorted(cands)
+    mid = cands_sorted[len(cands_sorted)//2]
+    sane = [x for x in cands_sorted if x <= (mid * 10)]
+    if not sane:
+        sane = cands_sorted
+    # Genelde gerçek fiyat küçük adaylar arasında olur (kargo/ufak rakamlar hariç)
+    # 100 TL altı (kargo vs.) çok küçükse ele
+    sane2 = [x for x in sane if x >= 100]
+    base = sane2 if sane2 else sane
+    return sorted(base)[0]
 
 def _find_ldjson_prices(soup: BeautifulSoup) -> Decimal | None:
-    """<script type="application/ld+json"> içinden offers.price okumaya çalış."""
+    """<script type="application/ld+json"> içinden offers.price vb. çek."""
+    cands: list[Decimal] = []
     for tag in soup.find_all("script", attrs={"type": "application/ld+json"}):
-        try:
-            data = json.loads(tag.string or tag.text or "{}")
-        except json.JSONDecodeError:
-            # bazı sitelerde birden fazla JSON obje dizi halinde
+        raw = tag.string or tag.text or ""
+        if not raw.strip():
+            continue
+        # Bazı sitelerde dizi, bazılarında tek obje; bazen de birden çok JSON satırı var
+        # Kolay yol: JSON parse etmeyi deney, olmazsa satır satır dene
+        tries = [raw]
+        if "\n" in raw:
+            tries.extend([line.strip() for line in raw.splitlines() if line.strip().startswith("{")])
+        for payload in tries:
             try:
-                data = json.loads((tag.string or tag.text or "").strip().split("\n", 1)[0])
+                data = json.loads(payload)
             except Exception:
                 continue
-        # tek obje veya liste
-        candidates = []
-        def collect(obj):
-            if isinstance(obj, dict):
-                # Product/offers.price
-                off = obj.get("offers")
-                if isinstance(off, dict):
-                    candidates.append(off.get("price") or off.get("lowPrice") or off.get("highPrice"))
-                # price belirtilmiş olabilir
-                for k in ("price", "priceAmount"):
-                    if k in obj:
-                        candidates.append(obj[k])
-                for v in obj.values():
-                    collect(v)
-            elif isinstance(obj, list):
-                for it in obj:
-                    collect(it)
-        collect(data)
-        for c in candidates:
-            d = _to_decimal(str(c))
-            if d:
-                return d
-    return None
+            # iç içe her yerde price/lowPrice/highPrice/priceAmount ara
+            def collect(obj):
+                if isinstance(obj, dict):
+                    for k, v in obj.items():
+                        if k in ("price", "lowPrice", "highPrice", "priceAmount", "priceValue", "rawPrice", "sellingPrice"):
+                            if isinstance(v, (int, float, str)):
+                                d = _to_decimal(str(v)) if isinstance(v, str) else Decimal(str(v))
+                                d = _fix_minor_units(d)
+                                if d:
+                                    cands.append(d)
+                        if isinstance(v, (dict, list)):
+                            collect(v)
+                elif isinstance(obj, list):
+                    for it in obj:
+                        collect(it)
+            collect(data)
+    return _pick_best(cands)
 
 # -----------------------------
 # Siteye özel: Trendyol
 # -----------------------------
 def parse_trendyol(html: str, soup: BeautifulSoup) -> Decimal | None:
-    # 1) ld+json
     d = _find_ldjson_prices(soup)
     if d:
         return d
-    # 2) Sık görülen sınıflar
+    # Sık sınıflar
     for cls in ["prc-dsc", "prc-slg", "product-price", "product-price-container"]:
         el = soup.find(class_=cls)
         if el:
             d = _to_decimal(el.get_text(" ", strip=True))
+            d = _fix_minor_units(d)
             if d:
                 return d
-    # 3) meta itemprop="price"
+    # itemprop="price"
     meta = soup.find(attrs={"itemprop": "price"})
     if meta and (meta.get("content") or meta.get("content") == "0"):
         d = _to_decimal(meta.get("content", ""))
+        d = _fix_minor_units(d)
         if d:
             return d
-    # 4) Regex fallback
+    # JSON fallback
     m = re.search(r'"price"\s*:\s*"?(?P<p>[\d\.,]+)"?', html)
     if m:
-        return _to_decimal(m.group("p"))
+        d = _to_decimal(m.group("p"))
+        return _fix_minor_units(d)
     return None
 
 # -----------------------------
 # Siteye özel: Hepsiburada
 # -----------------------------
 def parse_hepsiburada(html: str, soup: BeautifulSoup) -> Decimal | None:
-    # 1) ld+json
     d = _find_ldjson_prices(soup)
     if d:
         return d
-    # 2) meta property="product:price:amount"
     meta = soup.find("meta", attrs={"property": "product:price:amount"})
     if meta and meta.get("content"):
         d = _to_decimal(meta["content"])
+        d = _fix_minor_units(d)
         if d:
             return d
-    # 3) Sık sınıflar
-    classes = [
-        "product-price", "price", "extra-discounted-price", "extra-discount-price"
-    ]
-    for cls in classes:
+    for cls in ["product-price", "price", "extra-discounted-price", "extra-discount-price"]:
         el = soup.find(class_=cls)
         if el:
             d = _to_decimal(el.get_text(" ", strip=True))
+            d = _fix_minor_units(d)
             if d:
                 return d
-    # 4) window.__PRODUCT_DETAIL_APP_INITIAL_STATE__ JSON'undan çekme
+    # Hepsiburada sayfa state JSON
     m = re.search(r"__PRODUCT_DETAIL_APP_INITIAL_STATE__\s*=\s*({.*?});", html, re.DOTALL)
     if m:
         try:
             obj = json.loads(m.group(1))
-            # olası yollar
-            # obj["product"]["buybox"]["price"]["value"] gibi
-            def deep_find(o, keys=("price", "value", "priceValue")):
+            cands = []
+            def deep(o):
                 if isinstance(o, dict):
                     for k, v in o.items():
                         if k in ("price", "value", "priceValue", "rawPrice", "sellingPrice"):
                             if isinstance(v, (int, float, str)):
-                                d = _to_decimal(str(v))
+                                d = _to_decimal(str(v)) if isinstance(v, str) else Decimal(str(v))
+                                d = _fix_minor_units(d)
                                 if d:
-                                    return d
+                                    cands.append(d)
                         if isinstance(v, (dict, list)):
-                            r = deep_find(v, keys)
-                            if r:
-                                return r
+                            deep(v)
                 elif isinstance(o, list):
                     for it in o:
-                        r = deep_find(it, keys)
-                        if r:
-                            return r
-                return None
-            d = deep_find(obj)
-            if d:
-                return d
+                        deep(it)
+            deep(obj)
+            best = _pick_best(cands)
+            if best:
+                return best
         except Exception:
             pass
-    # 5) Regex offers.price
     m = re.search(r'"offers"\s*:\s*{[^}]*"price"\s*:\s*"?(?P<p>[\d\.,]+)"?', html)
     if m:
-        return _to_decimal(m.group("p"))
+        d = _to_decimal(m.group("p"))
+        return _fix_minor_units(d)
     return None
 
 # -----------------------------
 # Siteye özel: MediaMarkt TR
 # -----------------------------
 def parse_mediamarkt(html: str, soup: BeautifulSoup) -> Decimal | None:
-    # 1) ld+json
     d = _find_ldjson_prices(soup)
     if d:
         return d
-    # 2) meta property="product:price:amount"
     meta = soup.find("meta", attrs={"property": "product:price:amount"})
     if meta and meta.get("content"):
         d = _to_decimal(meta["content"])
+        d = _fix_minor_units(d)
         if d:
             return d
-    # 3) Sık sınıflar (eski/yeni site sınıfları)
-    classes = [
-        "mm-u-price__sale-price", "big-price", "price", "price__integer-value", "pdp-price"
-    ]
-    for cls in classes:
+    for cls in ["mm-u-price__sale-price", "big-price", "price", "price__integer-value", "pdp-price"]:
         el = soup.find(class_=cls)
         if el:
             d = _to_decimal(el.get_text(" ", strip=True))
+            d = _fix_minor_units(d)
             if d:
                 return d
-    # 4) Regex
     m = re.search(r'"price"\s*:\s*"?(?P<p>[\d\.,]+)"?', html)
     if m:
-        return _to_decimal(m.group("p"))
+        d = _to_decimal(m.group("p"))
+        return _fix_minor_units(d)
     return None
 
 # -----------------------------
-# Genel (fallback) yakalama
+# Genel (fallback)
 # -----------------------------
 def parse_generic(html: str, soup: BeautifulSoup) -> Decimal | None:
-    # 1) ld+json
     d = _find_ldjson_prices(soup)
     if d:
         return d
-    # 2) ₺ / TL geçen metinler
     text = soup.get_text(" ", strip=True)
-    patterns = [r"₺\s*([\d\.\,]+)", r"TL\s*([\d\.\,]+)"]
     cands = []
-    for pat in patterns:
+    for pat in (r"₺\s*([\d\.\,]+)", r"TL\s*([\d\.\,]+)"):
         for m in re.finditer(pat, text):
             d = _to_decimal(m.group(1))
+            d = _fix_minor_units(d)
             if d:
                 cands.append(d)
-    if cands:
-        cands.sort()
-        return cands[0]
-    return None
+    return _pick_best(cands)
 
 # -----------------------------
-# Tek giriş: URL'ye göre uygun parser
+# Tek giriş
 # -----------------------------
 def extract_price_from_page(url: str) -> Decimal | None:
     try:
@@ -281,7 +303,6 @@ async def periodic_check(context: ContextTypes.DEFAULT_TYPE):
                     await context.bot.send_message(chat_id=chat_id, text=msg)
                 except Exception as e:
                     logging.warning(f"Bildirim hatası: {e}")
-                # alarm vereni listeden düş
             else:
                 new_list.append(it)
         WATCHES[chat_id] = new_list
